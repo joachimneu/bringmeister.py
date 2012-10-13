@@ -5,6 +5,15 @@ import json
 import mechanize
 from lxml.html import parse
 
+class BringmeisterException(Exception):
+	pass
+
+class BringmeisterFormNotFoundException(BringmeisterException):
+	pass
+
+class BringmeisterUnknownAmountDescriptionException(BringmeisterException):
+	pass
+
 class FIFO:
 	def __init__(self):
 		self.data = []
@@ -43,14 +52,55 @@ def bringmeister_product_decode(obj):
 		
 	return obj
 
+class BringmeisterTimeslot:
+	def __init__(self, datetime_begin, datetime_end, link, price):
+		self.datetime_begin = datetime_begin
+		self.datetime_end = datetime_end
+		self.link = link
+		self.price = price
+	
+	def __repr__(self):
+		return 'BringmeisterTimeslot: ' + repr(self.datetime_begin) + ' to ' + repr(self.datetime_end) + ' (' + repr(self.price) + ')'
+
+def _cmp_bringmeister_timeslots(x, y):
+	if x.datetime_begin > y.datetime_begin:
+		return 1
+	elif x.datetime_begin == y.datetime_begin:
+		return 0
+	else:
+		return -1
+
 class BringmeisterClient:
-	def __init__(self, product_cache_file=None):
+	AMOUNT_PIECES = 'AMOUNT-PIECES'
+	AMOUNT_G = 'AMOUNT-G'
+	AMOUNT_KG = 'AMOUNT-KG'
+	
+	def __init__(self, product_cache_file=None, email=None, password=None):
 		self.product_cache_file = product_cache_file
 		self.products = {}
 		if self.product_cache_file:
 			self.product_cache_read()
 		self.browser = mechanize.Browser()
 		self.browser.set_handle_robots(False)
+		self.email = email
+		self.password = password
+		self.logout()
+		if self.email:
+			self.login()
+	
+	def logout(self):
+		self.browser.open('https://www.bringmeister.de/Shop/logout')
+	
+	def login(self):
+		self.browser.open('https://www.bringmeister.de/Shop/login')
+		for f in self.browser.forms():
+			if f.action == 'https://www.bringmeister.de/Shop/login/stamm':
+				self.browser.form = f
+				self.browser['account'] = self.email
+				self.browser['pw'] = self.password
+				self.browser.submit()
+				return
+		raise BringmeisterFormNotFoundException
 	
 	def product_cache_refresh(self):
 		links = FIFO()
@@ -107,6 +157,17 @@ class BringmeisterClient:
 					product.price_extra = ''
 				elif product.price_extra.startswith(u'Grundpreis€  '):
 					product.price_extra = u'Grundpreis: € ' + product.price_extra[13:]
+				product.amount_options = []
+				for o in p.cssselect('td.col_price div.options option'):
+					if o.get('value') == 'S':
+						product.amount_options.append(self.AMOUNT_PIECES)
+					elif o.get('value') == 'G':
+						product.amount_options.append(self.AMOUNT_G)
+					elif o.get('value') == 'KG':
+						product.amount_options.append(self.AMOUNT_KG)
+					else:
+						print o, o.get('value'), o.text_content()
+						raise BringmeisterUnknownAmountDescriptionException
 				products[product_url] = product
 	
 			visited.append(url)
@@ -124,3 +185,88 @@ class BringmeisterClient:
 		for i, obj in self.products.items():
 			if regexp.findall(' '.join([obj.pnr, obj.name1, obj.name2, obj.packaging])):
 				yield obj
+	
+	def cart_add_product(self, product, amount, amount_type):
+		self.browser.open(product.url)
+		self.browser.select_form(name='productsubmit')
+		self.browser['cnt'] = str(amount)
+		if amount_type == self.AMOUNT_PIECES:
+			self.browser['vke'] = ['S']
+		elif amount_type == self.AMOUNT_G:
+			self.browser['vke'] = ['G']
+		elif amount_type == self.AMOUNT_KG:
+			self.browser['vke'] = ['KG']
+		else:
+			print amount_type
+			raise BringmeisterUnknownAmountDescriptionException
+		self.browser.submit()
+	
+	def timeslot_list(self):
+		import datetime
+		node_root = parse(self.browser.open('http://www.bringmeister.de/Shop/timeslot')).getroot()
+		timeslots = []
+		weeks = []
+		for w in node_root.cssselect('div.calendar_column div.selectbox div.weekpic > div'):
+			weeks.append({})
+			weeks[-1]['start'] = datetime.datetime(int(w.text_content().split('-')[0].strip().split('.')[2]), int(w.text_content().split('-')[0].strip().split('.')[1]), int(w.text_content().split('-')[0].strip().split('.')[0]))
+		for i in range(len(weeks)):
+			j = 0
+			for e in node_root.cssselect('div.calendar_column div.date_wrap.w%d > div'% (i,)):
+				if not e.get('class') in ['line', 'first', 'clear', None]:
+					datetime_start = weeks[i]['start'] + datetime.timedelta(days=j%7)
+					if j < 7:
+						datetime_start += datetime.timedelta(seconds=3600*9)
+					elif j < 14:
+						datetime_start += datetime.timedelta(seconds=3600*10)
+					elif j < 21:
+						datetime_start += datetime.timedelta(seconds=3600*11)
+					elif j < 28:
+						datetime_start += datetime.timedelta(seconds=3600*12)
+					elif j < 35:
+						datetime_start += datetime.timedelta(seconds=3600*13)
+					elif j < 42:
+						datetime_start += datetime.timedelta(seconds=3600*14)
+					elif j < 49:
+						datetime_start += datetime.timedelta(seconds=3600*15)
+					elif j < 56:
+						datetime_start += datetime.timedelta(seconds=3600*16)
+					elif j < 63:
+						datetime_start += datetime.timedelta(seconds=3600*17)
+					elif j < 70:
+						datetime_start += datetime.timedelta(seconds=3600*18)
+					elif j < 77:
+						datetime_start += datetime.timedelta(seconds=3600*19)
+					else:
+						raise BringmeisterException
+					datetime_end = datetime_start + datetime.timedelta(seconds=3600*2)
+					if e.get('class') == 'timeslot_square':
+						link = e.cssselect('a')[0].get('href')
+						price = float(''.join([ c for c in e.cssselect('a')[0].text_content().strip() if c in '0123456789' ]))
+						timeslots.append(BringmeisterTimeslot(datetime_start, datetime_end, link, price))
+					j += 1
+		timeslots.sort(_cmp_bringmeister_timeslots)
+		return timeslots
+	
+	def timeslot_select(self, timeslot):
+		self.browser.open(timeslot.link)
+		self.browser.open('http://www.bringmeister.de/Shop/timeslot/save')
+	
+	def cookies_export_to_epiphany(self):
+		for c in self.browser._ua_handlers['_cookies'].cookiejar:
+			print c
+			c_name = c.name
+			c_value = c.value
+			c_expires = c.expires
+			if c_name == 'askzipcode':
+				c_value = '0'
+			self._cookies_export_to_epiphany(c_name, c_value, c_expires)
+
+	def _cookies_export_to_epiphany(self, c_name, c_value, c_expires):
+		import os
+		import sqlite3
+		conn = sqlite3.connect(os.environ['HOME'] + '/.gnome2/epiphany/cookies.sqlite')
+		c = conn.cursor()
+		c.execute('DELETE FROM moz_cookies WHERE name=\'%s\' AND host=\'www.bringmeister.de\''% (c_name,))
+		c.execute('INSERT INTO moz_cookies(name, value, host, path, expiry, lastAccessed, isSecure, isHttpOnly) VALUES(\'%s\', \'%s\', \'www.bringmeister.de\', \'/\', \'%d\', \'\', 0, 0)'% (c_name, c_value, c_expires))
+		conn.commit()
+		conn.close()
